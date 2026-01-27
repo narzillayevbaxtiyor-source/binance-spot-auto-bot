@@ -18,9 +18,7 @@ BINANCE_API_KEY = (os.getenv("BINANCE_API_KEY") or "").strip()
 BINANCE_API_SECRET = (os.getenv("BINANCE_API_SECRET") or "").strip()
 
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
-
-# Faqat shu user tasdiqlay oladi (sening Telegram ID)
-ALLOWED_USER_ID = int((os.getenv("ALLOWED_USER_ID") or "0").strip() or "0")
+ALLOWED_USER_ID = int((os.getenv("ALLOWED_USER_ID") or "0").strip() or "0")  # faqat shu user tasdiqlaydi
 
 # Binance SPOT endpoint fallback
 BINANCE_BASES = [
@@ -37,32 +35,63 @@ SESSION = requests.Session()
 # SETTINGS
 # =========================
 INTERVAL = os.getenv("INTERVAL", "3m")
-SCAN_EVERY_SEC = int(os.getenv("SCAN_EVERY_SEC", "10"))
-TOP_REFRESH_SEC = int(os.getenv("TOP_REFRESH_SEC", "180"))
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "200"))
+
+# tezliklar:
+ENTRY_SCAN_SEC = int(os.getenv("ENTRY_SCAN_SEC", "12"))   # klines bilan signal qidirish (12s)
+POS_POLL_SEC = float(os.getenv("POS_POLL_SEC", "1"))      # pozitsiya monitoring (1s) -> tez SELL/SL/TP
+TOP_REFRESH_SEC = int(os.getenv("TOP_REFRESH_SEC", "180"))
 
 SYMBOL_MODE = (os.getenv("SYMBOL_MODE") or "TOP10").strip().upper()  # TOP10 or LIST
 SYMBOLS = [s.strip().upper() for s in (os.getenv("SYMBOLS") or "").split(",") if s.strip()]
 
 STATE_FILE = os.getenv("STATE_FILE") or "state.json"
-
 QUOTE_ASSET = (os.getenv("QUOTE_ASSET") or "USDT").strip().upper()
 
-# Default order sizing mode:
-# SIZE_MODE = "USDT" or "RISK"
-SIZE_MODE = (os.getenv("SIZE_MODE") or "USDT").strip().upper()
-DEFAULT_USDT = float(os.getenv("DEFAULT_USDT") or "20")      # masalan 20 USDT
-DEFAULT_RISK = float(os.getenv("DEFAULT_RISK") or "0.02")    # masalan balans 2%
+# sizing:
+SIZE_MODE = (os.getenv("SIZE_MODE") or "USDT").strip().upper()      # USDT or RISK
+DEFAULT_USDT = float(os.getenv("DEFAULT_USDT") or "20")
+DEFAULT_RISK = float(os.getenv("DEFAULT_RISK") or "0.02")
 
-# Stoploss offset (0.1% = 0.001)
-SL_OFFSET = float(os.getenv("SL_OFFSET") or "0.002")  # 0.2% default (3m uchun yaxshiroq)
+# SL (0.1% = 0.001). 3m uchun default 0.2%
+SL_OFFSET = float(os.getenv("SL_OFFSET") or "0.002")
 
-# Buy tasdiqlash timeout (sekund)
+# Break-even (ixtiyoriy): foydaga chiqqanda SL entryga ko‘chadi
+BE_TRIGGER = float(os.getenv("BE_TRIGGER") or "0.0015")  # 0.15% (xohlasang 0.002 = 0.2%)
+
+# Approval timeout
 APPROVE_TIMEOUT_SEC = int(os.getenv("APPROVE_TIMEOUT_SEC") or "120")
+MAX_PENDING = int(os.getenv("MAX_PENDING") or "25")
 
-# Pending orderlarda safety
-MAX_PENDING = int(os.getenv("MAX_PENDING") or "20")
+# =========================
+# Utils
+# =========================
+def now_ts() -> int:
+    return int(time.time())
 
+def safe_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+def fmt(p: float) -> str:
+    if p >= 1:
+        return f"{p:.6f}".rstrip("0").rstrip(".")
+    return f"{p:.10f}".rstrip("0").rstrip(".")
+
+def http_get_json(path: str, params: Optional[dict] = None, timeout: int = 12):
+    last_err = None
+    for base in BINANCE_BASES:
+        url = base + path
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"All Binance endpoints failed: {path}. Last error: {last_err}")
 
 # =========================
 # State
@@ -73,7 +102,8 @@ def load_state() -> dict:
             "symbols": {},
             "top10": [],
             "last_top_refresh": 0,
-            "pending": {},   # order_id -> payload
+            "pending": {},        # order_id -> payload
+            "positions": {},      # symbol -> position dict
             "prefs": {
                 "size_mode": SIZE_MODE,
                 "default_usdt": DEFAULT_USDT,
@@ -89,6 +119,7 @@ def load_state() -> dict:
             "top10": [],
             "last_top_refresh": 0,
             "pending": {},
+            "positions": {},
             "prefs": {"size_mode": SIZE_MODE, "default_usdt": DEFAULT_USDT, "default_risk": DEFAULT_RISK}
         }
 
@@ -98,31 +129,16 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_FILE)
 
-def now_ts() -> int:
-    return int(time.time())
-
-def safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
-
-def http_get_json(path: str, params: Optional[dict] = None, timeout: int = 12):
-    last_err = None
-    for base in BINANCE_BASES:
-        url = base + path
-        try:
-            r = SESSION.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"All Binance endpoints failed: {path}. Last error: {last_err}")
-
+def get_prefs(state: dict) -> dict:
+    state.setdefault("prefs", {})
+    p = state["prefs"]
+    p.setdefault("size_mode", SIZE_MODE)
+    p.setdefault("default_usdt", DEFAULT_USDT)
+    p.setdefault("default_risk", DEFAULT_RISK)
+    return p
 
 # =========================
-# Binance (public)
+# Binance public
 # =========================
 def get_exchange_info_symbols_usdt() -> set:
     data = http_get_json("/api/v3/exchangeInfo")
@@ -167,9 +183,8 @@ def get_spot_price(symbol: str) -> float:
     data = http_get_json("/api/v3/ticker/price", params={"symbol": symbol})
     return safe_float(data.get("price", 0))
 
-
 # =========================
-# Binance (signed)
+# Binance signed
 # =========================
 def sign_query(params: Dict) -> str:
     qs = urllib.parse.urlencode(params, doseq=True)
@@ -185,7 +200,6 @@ def signed_request(method: str, path: str, params: Dict):
     qs = sign_query(params)
 
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-
     last_err = None
     for base in BINANCE_BASES:
         url = base + path + "?" + qs
@@ -201,32 +215,31 @@ def signed_request(method: str, path: str, params: Dict):
 def get_account_info_signed() -> dict:
     return signed_request("GET", "/api/v3/account", {})
 
-def get_symbol_info(symbol: str) -> dict:
-    data = http_get_json("/api/v3/exchangeInfo", params={"symbol": symbol})
-    syms = data.get("symbols", [])
-    return syms[0] if syms else {}
-
-def lot_step_for_symbol(symbol_info: dict) -> Tuple[float, float]:
-    min_qty = 0.0
-    step = 0.0
-    for f in symbol_info.get("filters", []):
-        if f.get("filterType") == "LOT_SIZE":
-            min_qty = safe_float(f.get("minQty"))
-            step = safe_float(f.get("stepSize"))
-            break
-    return (min_qty, step)
-
-def round_step(qty: float, step: float) -> float:
-    if step <= 0:
-        return qty
-    return (qty // step) * step
-
 def get_free_balance(asset: str) -> float:
     info = get_account_info_signed()
     for b in info.get("balances", []):
         if b.get("asset") == asset:
             return safe_float(b.get("free"))
     return 0.0
+
+def get_symbol_info(symbol: str) -> dict:
+    data = http_get_json("/api/v3/exchangeInfo", params={"symbol": symbol})
+    syms = data.get("symbols", [])
+    return syms[0] if syms else {}
+
+def lot_step_for_symbol(symbol_info: dict) -> Tuple[float, float]:
+    min_qty, step = 0.0, 0.0
+    for f in symbol_info.get("filters", []):
+        if f.get("filterType") == "LOT_SIZE":
+            min_qty = safe_float(f.get("minQty"))
+            step = safe_float(f.get("stepSize"))
+            break
+    return min_qty, step
+
+def round_step(qty: float, step: float) -> float:
+    if step <= 0:
+        return qty
+    return (qty // step) * step
 
 def place_market_order(symbol: str, side: str, quantity: float) -> dict:
     params = {
@@ -238,9 +251,26 @@ def place_market_order(symbol: str, side: str, quantity: float) -> dict:
     }
     return signed_request("POST", "/api/v3/order", params)
 
+def compute_qty(symbol: str, price: float, size_mode: str, usdt_amount: float, risk_pct: float) -> float:
+    if size_mode == "USDT":
+        spend = usdt_amount
+    else:
+        usdt_free = get_free_balance(QUOTE_ASSET)
+        spend = usdt_free * risk_pct
+
+    if spend <= 10:
+        raise RuntimeError(f"{QUOTE_ASSET} amount too small: {spend}")
+
+    raw_qty = spend / price
+    info = get_symbol_info(symbol)
+    min_qty, step = lot_step_for_symbol(info)
+    qty = round_step(raw_qty, step)
+    if qty < min_qty:
+        raise RuntimeError(f"Qty < minQty. qty={qty} minQty={min_qty}")
+    return float(qty)
 
 # =========================
-# Strategy (entry only for approval)
+# Strategy (BUY signal only)
 # =========================
 def is_green(c: dict) -> bool:
     return c["close"] > c["open"]
@@ -270,16 +300,7 @@ def ensure_symbol_state(state: dict, symbol: str) -> SymbolState:
 def update_symbol_state_dict(state: dict, symbol: str, st: SymbolState) -> None:
     state["symbols"][symbol] = asdict(st)
 
-def analyze_entry(symbol: str, st: SymbolState, klines: List[dict], price: float) -> Tuple[SymbolState, Optional[dict]]:
-    """
-    BUY signal:
-    - make high start: red->first green
-    - green run -> first red (turn red)
-    - price < turn_red_low => pullback start
-    - track last red candle during pullback
-    - BUY when price > last red high
-    SL = last red low * (1 - SL_OFFSET)
-    """
+def analyze_buy_signal(symbol: str, st: SymbolState, klines: List[dict], price: float) -> Tuple[SymbolState, Optional[dict]]:
     if len(klines) < 6:
         return st, None
 
@@ -289,7 +310,6 @@ def analyze_entry(symbol: str, st: SymbolState, klines: List[dict], price: float
     def sig_key(kind: str, t: int) -> str:
         return f"{kind}:{t}"
 
-    # 1) make-high start
     if st.stage == "SEEK_MAKEHIGH_START":
         if is_red(prev_closed) and is_green(last_closed):
             st.stage = "GREEN_RUN"
@@ -298,13 +318,11 @@ def analyze_entry(symbol: str, st: SymbolState, klines: List[dict], price: float
             st.last_bear_high = 0.0
             st.last_bear_low = 0.0
 
-    # 2) green run ends on first red
     elif st.stage == "GREEN_RUN":
         if is_red(last_closed):
             st.turn_red_low = last_closed["low"]
             st.stage = "WAIT_PULLBACK_BREAK"
 
-    # 3) pullback starts when price breaks below turn-red low
     elif st.stage == "WAIT_PULLBACK_BREAK":
         if st.turn_red_low > 0 and price < st.turn_red_low:
             st.stage = "PULLBACK_BEARISH"
@@ -313,7 +331,6 @@ def analyze_entry(symbol: str, st: SymbolState, klines: List[dict], price: float
                 st.last_bear_high = last_closed["high"]
                 st.last_bear_low = last_closed["low"]
 
-    # 4) in pullback track last red candle
     elif st.stage == "PULLBACK_BEARISH":
         if is_red(last_closed):
             st.last_bear_close_time = last_closed["close_time"]
@@ -323,7 +340,6 @@ def analyze_entry(symbol: str, st: SymbolState, klines: List[dict], price: float
             if st.last_bear_high > 0:
                 st.stage = "WAIT_BUY_BREAK"
 
-    # 5) buy on break above last red high
     elif st.stage == "WAIT_BUY_BREAK":
         if is_red(last_closed):
             st.stage = "PULLBACK_BEARISH"
@@ -331,6 +347,7 @@ def analyze_entry(symbol: str, st: SymbolState, klines: List[dict], price: float
             st.last_bear_high = last_closed["high"]
             st.last_bear_low = last_closed["low"]
         else:
+            # ✅ “max yoriganda tezroq” — bu yerda LIVE price bilan tekshiryapmiz
             if st.last_bear_high > 0 and price > st.last_bear_high:
                 key = sig_key("BUY", st.last_bear_close_time or last_closed["close_time"])
                 if st.last_signal == key:
@@ -338,6 +355,7 @@ def analyze_entry(symbol: str, st: SymbolState, klines: List[dict], price: float
                 st.last_signal = key
 
                 sl = st.last_bear_low * (1.0 - SL_OFFSET)
+
                 payload = {
                     "symbol": symbol,
                     "price": price,
@@ -346,26 +364,18 @@ def analyze_entry(symbol: str, st: SymbolState, klines: List[dict], price: float
                     "ts": now_ts(),
                     "interval": INTERVAL,
                 }
-                # reset state to search next cycle
                 st = SymbolState()
                 return st, payload
 
     return st, None
 
-
 # =========================
-# Telegram UI (approval)
+# Telegram approval UI
 # =========================
-def fmt(p: float) -> str:
-    if p >= 1:
-        return f"{p:.6f}".rstrip("0").rstrip(".")
-    return f"{p:.10f}".rstrip("0").rstrip(".")
-
 def make_order_id() -> str:
     return f"o{int(time.time()*1000)}"
 
 def build_keyboard(order_id: str) -> InlineKeyboardMarkup:
-    # quick sizes + approve/reject
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ BUY (default)", callback_data=f"APPROVE|{order_id}|DEF"),
@@ -378,69 +388,72 @@ def build_keyboard(order_id: str) -> InlineKeyboardMarkup:
         ],
     ])
 
-def get_prefs(state: dict) -> dict:
-    state.setdefault("prefs", {})
-    prefs = state["prefs"]
-    prefs.setdefault("size_mode", SIZE_MODE)
-    prefs.setdefault("default_usdt", DEFAULT_USDT)
-    prefs.setdefault("default_risk", DEFAULT_RISK)
-    return prefs
+async def tg_send(app: Application, text: str):
+    try:
+        await app.bot.send_message(chat_id=ALLOWED_USER_ID, text=text)
+    except Exception:
+        pass
 
-def compute_qty_for_symbol(symbol: str, price: float, mode: str, usdt_amount: float, risk_pct: float) -> float:
-    if mode == "USDT":
-        spend = usdt_amount
-    else:
-        usdt_free = get_free_balance(QUOTE_ASSET)
-        spend = usdt_free * risk_pct
+async def send_approval(app: Application, payload: dict):
+    st = load_state()
+    pending = st.get("pending", {}) or {}
+    if len(pending) >= MAX_PENDING:
+        return
 
-    if spend <= 10:
-        raise RuntimeError(f"{QUOTE_ASSET} amount too small: {spend}")
+    oid = make_order_id()
+    pending[oid] = payload
+    st["pending"] = pending
+    save_state(st)
 
-    raw_qty = spend / price
-    info = get_symbol_info(symbol)
-    min_qty, step = lot_step_for_symbol(info)
-    qty = round_step(raw_qty, step)
-    if qty < min_qty:
-        raise RuntimeError(f"Qty < minQty. qty={qty} minQty={min_qty}")
-    return float(qty)
-
+    txt = (
+        f"📣 BUY signal (ruxsat kerak)\n"
+        f"{payload['symbol']}\n"
+        f"TF: {payload['interval']}\n"
+        f"Break HIGH: {fmt(payload['break_high'])}\n"
+        f"Price: {fmt(payload['price'])}\n"
+        f"SL: {fmt(payload['sl'])}\n"
+    )
+    await app.bot.send_message(chat_id=ALLOWED_USER_ID, text=txt, reply_markup=build_keyboard(oid))
 
 # =========================
 # Commands
 # =========================
+def is_allowed(update: Update) -> bool:
+    return (not ALLOWED_USER_ID) or (update.effective_user and update.effective_user.id == ALLOWED_USER_ID)
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_USER_ID and update.effective_user and update.effective_user.id != ALLOWED_USER_ID:
+    if not is_allowed(update):
         return
     await update.message.reply_text(
         "✅ Bot ishlayapti.\n\n"
+        "BUY signal -> sizdan ruxsat so‘raydi.\n"
+        "SELL -> avtomat (tez monitoring).\n\n"
         "Buyruqlar:\n"
-        "/mode usdt   — default sizing USDT\n"
-        "/mode risk   — default sizing balans %\n"
-        "/setusdt 25  — default USDT miqdor\n"
-        "/setrisk 0.02 — default risk 2%\n"
-        "/status      — holat\n"
+        "/status\n"
+        "/mode usdt | risk\n"
+        "/setusdt 25\n"
+        "/setrisk 0.02\n"
     )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_USER_ID and update.effective_user and update.effective_user.id != ALLOWED_USER_ID:
+    if not is_allowed(update):
         return
     st = load_state()
     prefs = get_prefs(st)
-    top10 = st.get("top10", [])
-    pending = st.get("pending", {})
+    pos = st.get("positions", {}) or {}
     msg = (
         f"TF: {INTERVAL}\n"
-        f"MODE: {SYMBOL_MODE}\n"
+        f"ENTRY_SCAN_SEC: {ENTRY_SCAN_SEC}s\n"
+        f"POS_POLL_SEC: {POS_POLL_SEC}s\n"
         f"Size mode: {prefs['size_mode']}\n"
         f"Default USDT: {prefs['default_usdt']}\n"
         f"Default risk: {prefs['default_risk']}\n"
-        f"Pending: {len(pending)}\n\n"
-        f"TOP10:\n" + ("\n".join(top10) if top10 else "—")
+        f"Positions: {len(pos)}\n"
     )
     await update.message.reply_text(msg)
 
 async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_USER_ID and update.effective_user and update.effective_user.id != ALLOWED_USER_ID:
+    if not is_allowed(update):
         return
     if not context.args:
         await update.message.reply_text("Foydalanish: /mode usdt  yoki  /mode risk")
@@ -456,7 +469,7 @@ async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Size mode = {m}")
 
 async def setusdt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_USER_ID and update.effective_user and update.effective_user.id != ALLOWED_USER_ID:
+    if not is_allowed(update):
         return
     if not context.args:
         await update.message.reply_text("Foydalanish: /setusdt 25")
@@ -472,10 +485,10 @@ async def setusdt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Default USDT = {val}")
 
 async def setrisk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_USER_ID and update.effective_user and update.effective_user.id != ALLOWED_USER_ID:
+    if not is_allowed(update):
         return
     if not context.args:
-        await update.message.reply_text("Foydalanish: /setrisk 0.02 (2%)")
+        await update.message.reply_text("Foydalanish: /setrisk 0.02")
         return
     val = safe_float(context.args[0])
     if val <= 0 or val > 1:
@@ -487,9 +500,8 @@ async def setrisk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state(st)
     await update.message.reply_text(f"✅ Default risk = {val} ({val*100:.2f}%)")
 
-
 # =========================
-# Callback (approve/reject)
+# Callback approve/reject (BUY only)
 # =========================
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -501,40 +513,47 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⛔ Ruxsat yo‘q.")
         return
 
-    data = (q.data or "").split("|")
-    if not data:
+    parts = (q.data or "").split("|")
+    if not parts:
         return
 
     st = load_state()
     pending = st.get("pending", {}) or {}
+    positions = st.get("positions", {}) or {}
+    prefs = get_prefs(st)
 
-    if data[0] == "REJECT":
-        oid = data[1] if len(data) > 1 else ""
-        if oid in pending:
-            pending.pop(oid, None)
-            st["pending"] = pending
-            save_state(st)
+    if parts[0] == "REJECT":
+        oid = parts[1] if len(parts) > 1 else ""
+        pending.pop(oid, None)
+        st["pending"] = pending
+        save_state(st)
         await q.edit_message_text("❌ Bekor qilindi.")
         return
 
-    if data[0] == "APPROVE":
-        oid = data[1] if len(data) > 1 else ""
-        mode_arg = data[2] if len(data) > 2 else "DEF"
+    if parts[0] == "APPROVE":
+        oid = parts[1] if len(parts) > 1 else ""
+        mode_arg = parts[2] if len(parts) > 2 else "DEF"
 
         p = pending.get(oid)
         if not p:
-            await q.edit_message_text("⚠️ Bu order eskirgan yoki topilmadi.")
+            await q.edit_message_text("⚠️ Eskirgan yoki topilmadi.")
             return
 
-        # timeout
         if now_ts() - int(p.get("ts", 0)) > APPROVE_TIMEOUT_SEC:
             pending.pop(oid, None)
             st["pending"] = pending
             save_state(st)
-            await q.edit_message_text("⌛ Timeout. Order bekor bo‘ldi.")
+            await q.edit_message_text("⌛ Timeout. Bekor bo‘ldi.")
             return
 
-        prefs = get_prefs(st)
+        symbol = p["symbol"]
+        if symbol in positions:
+            pending.pop(oid, None)
+            st["pending"] = pending
+            save_state(st)
+            await q.edit_message_text("⚠️ Bu coinda allaqachon pozitsiya bor.")
+            return
+
         size_mode = prefs["size_mode"]
         usdt_amt = float(prefs["default_usdt"])
         risk_pct = float(prefs["default_risk"])
@@ -543,123 +562,184 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             size_mode = "USDT"
             usdt_amt = safe_float(mode_arg.split(":", 1)[1]) or usdt_amt
 
-        symbol = p["symbol"]
-        price = float(p["price"])
+        price = get_spot_price(symbol)  # tezroq, aktual
+        sl = float(p["sl"])
 
         try:
-            qty = compute_qty_for_symbol(symbol, price, size_mode, usdt_amt, risk_pct)
+            qty = compute_qty(symbol, price, size_mode, usdt_amt, risk_pct)
             order = place_market_order(symbol, "BUY", qty)
+
+            # position saqlaymiz
+            positions[symbol] = {
+                "qty": qty,
+                "entry": price,
+                "sl": sl,
+                "be_on": False,
+                "trail_low": 0.0,
+                "last_trail_close_time": 0,
+                "opened_ts": now_ts(),
+            }
+
             pending.pop(oid, None)
             st["pending"] = pending
+            st["positions"] = positions
             save_state(st)
 
             await q.edit_message_text(
-                f"✅ BUY EXECUTED\n"
-                f"{symbol}\n"
+                f"✅ BUY EXECUTED\n{symbol}\n"
                 f"Qty: {qty}\n"
-                f"Mode: {size_mode}\n"
-                f"USDT: {usdt_amt}\n"
-                f"Risk: {risk_pct}\n"
-                f"Approx price: {fmt(price)}"
+                f"Entry: {fmt(price)}\n"
+                f"SL: {fmt(sl)}\n"
+                f"BE trigger: {BE_TRIGGER*100:.2f}%\n"
+                f"(SELL avtomat)"
             )
         except Exception as e:
             await q.edit_message_text(f"⚠️ BUY FAILED: {e}")
         return
 
+# =========================
+# Exit logic (SELL avtomat, tez)
+# TP: oxirgi yopilgan sham LOW yorilishi (trail_low break)
+# SL: price <= sl
+# BE: price >= entry*(1+BE_TRIGGER) bo‘lsa SL=entry
+# =========================
+async def update_trailing_low(symbol: str, pos: dict) -> dict:
+    """
+    trail_low = oxirgi yopilgan 3m shamning LOW'i
+    Buni har 10-15 soniyada yangilab turamiz (rate limitni saqlash uchun).
+    """
+    try:
+        kl = get_klines(symbol, INTERVAL, 10)
+        last_closed = kl[-2]
+        ct = int(last_closed["close_time"])
+        if ct != int(pos.get("last_trail_close_time", 0)):
+            pos["last_trail_close_time"] = ct
+            pos["trail_low"] = float(last_closed["low"])
+    except Exception:
+        pass
+    return pos
+
+async def monitor_positions(app: Application):
+    while True:
+        st = load_state()
+        positions = st.get("positions", {}) or {}
+        if not positions:
+            await asyncio.sleep(POS_POLL_SEC)
+            continue
+
+        changed = False
+
+        for sym, pos in list(positions.items()):
+            try:
+                price = get_spot_price(sym)
+
+                entry = float(pos.get("entry", 0.0))
+                sl = float(pos.get("sl", 0.0))
+
+                # BE: foydaga chiqqanda SL entryga ko‘chadi
+                if entry > 0 and (not pos.get("be_on", False)) and price >= entry * (1.0 + BE_TRIGGER):
+                    pos["sl"] = entry
+                    pos["be_on"] = True
+                    changed = True
+                    await tg_send(app, f"🟡 BE ACTIVATED\n{sym}\nSL -> entry ({fmt(entry)})")
+
+                # Trail low yangilash (sekundiga emas, vaqti-vaqti bilan)
+                # har 12s ga yaqin yangilash uchun:
+                if now_ts() % max(ENTRY_SCAN_SEC, 8) == 0:
+                    pos = await update_trailing_low(sym, pos)
+                    positions[sym] = pos
+                    changed = True
+
+                trail_low = float(pos.get("trail_low", 0.0))
+
+                # 1) SL tez chiqish (1s poll)
+                if sl > 0 and price <= sl:
+                    qty = float(pos.get("qty", 0.0))
+                    place_market_order(sym, "SELL", qty)
+                    await tg_send(app, f"🟥 SL SELL\n{sym}\nPrice: {fmt(price)}\nSL: {fmt(sl)}")
+                    positions.pop(sym, None)
+                    changed = True
+                    continue
+
+                # 2) TP tez chiqish (oxirgi yopilgan sham low break)
+                # “minimum yangilaganda tez chiqish”
+                if trail_low > 0 and price < trail_low:
+                    qty = float(pos.get("qty", 0.0))
+                    place_market_order(sym, "SELL", qty)
+                    await tg_send(app, f"🟩 TP SELL\n{sym}\nPrice: {fmt(price)}\nTrailLow: {fmt(trail_low)}")
+                    positions.pop(sym, None)
+                    changed = True
+                    continue
+
+            except Exception as e:
+                await tg_send(app, f"⚠️ position monitor error {sym}: {e}")
+
+        if changed:
+            st["positions"] = positions
+            save_state(st)
+
+        await asyncio.sleep(POS_POLL_SEC)
 
 # =========================
-# Scanner loop -> sends approval requests
+# Entry scan loop (klines + top10)
 # =========================
-async def send_approval(app: Application, symbol_payload: dict):
-    # Send to allowed user (private chat with bot)
-    chat_id = ALLOWED_USER_ID
-    if not chat_id:
-        return
-
+async def entry_scanner(app: Application):
     st = load_state()
-    pending = st.get("pending", {}) or {}
-    if len(pending) >= MAX_PENDING:
-        return
-
-    oid = make_order_id()
-    pending[oid] = symbol_payload
-    st["pending"] = pending
-    save_state(st)
-
-    sym = symbol_payload["symbol"]
-    price = float(symbol_payload["price"])
-    sl = float(symbol_payload["sl"])
-    bh = float(symbol_payload["break_high"])
-
-    prefs = get_prefs(st)
-    txt = (
-        f"📣 SIGNAL BUY (approval)\n"
-        f"{sym}\n"
-        f"TF: {symbol_payload.get('interval','')}\n"
-        f"Break HIGH: {fmt(bh)}\n"
-        f"Price: {fmt(price)}\n"
-        f"SL: {fmt(sl)}\n\n"
-        f"Default size: {prefs['size_mode']} | "
-        f"{prefs['default_usdt']} USDT | risk {prefs['default_risk']}"
-    )
-
-    await app.bot.send_message(chat_id=chat_id, text=txt, reply_markup=build_keyboard(oid))
-
-
-async def scanner_loop(app: Application):
-    state = load_state()
     tradable_usdt = set()
     try:
         tradable_usdt = get_exchange_info_symbols_usdt()
     except Exception as e:
-        await app.bot.send_message(chat_id=ALLOWED_USER_ID, text=f"⚠️ exchangeInfo error: {e}")
+        await tg_send(app, f"⚠️ exchangeInfo error: {e}")
 
-    top10 = state.get("top10", []) or []
+    top10 = st.get("top10", []) or []
 
     while True:
         try:
-            state = load_state()
+            st = load_state()
+            prefs = get_prefs(st)
 
-            # refresh top10
+            # refresh TOP10
             if SYMBOL_MODE == "TOP10":
-                if now_ts() - int(state.get("last_top_refresh", 0)) >= TOP_REFRESH_SEC or not top10:
+                if now_ts() - int(st.get("last_top_refresh", 0)) >= TOP_REFRESH_SEC or not top10:
                     top10 = get_top10_gainers_usdt(tradable_usdt)
-                    state["top10"] = top10
-                    state["last_top_refresh"] = now_ts()
+                    st["top10"] = top10
+                    st["last_top_refresh"] = now_ts()
 
-                    # clean removed symbol states
-                    for sym in list(state.get("symbols", {}).keys()):
+                    # removed symbols cleanup
+                    for sym in list(st.get("symbols", {}).keys()):
                         if sym not in top10:
-                            state["symbols"].pop(sym, None)
+                            st["symbols"].pop(sym, None)
 
-                    save_state(state)
+                    save_state(st)
                 symbols = top10
             else:
                 symbols = SYMBOLS[:]
 
+            positions = st.get("positions", {}) or {}
+
             for sym in symbols:
-                st_sym = ensure_symbol_state(state, sym)
+                # allaqachon pozitsiya bo‘lsa entry qidirmaymiz
+                if sym in positions:
+                    continue
+
+                st_sym = ensure_symbol_state(st, sym)
+
+                # klines + price
                 kl = get_klines(sym, INTERVAL, KLINE_LIMIT)
                 price = get_spot_price(sym)
 
-                st_sym, payload = analyze_entry(sym, st_sym, kl, price)
-                update_symbol_state_dict(state, sym, st_sym)
+                st_sym, payload = analyze_buy_signal(sym, st_sym, kl, price)
+                update_symbol_state_dict(st, sym, st_sym)
 
                 if payload:
-                    # send approval request
                     await send_approval(app, payload)
 
-            save_state(state)
+            save_state(st)
 
         except Exception as e:
-            if ALLOWED_USER_ID:
-                try:
-                    await app.bot.send_message(chat_id=ALLOWED_USER_ID, text=f"⚠️ Scan error: {e}")
-                except Exception:
-                    pass
+            await tg_send(app, f"⚠️ entry scan error: {e}")
 
-        await asyncio.sleep(SCAN_EVERY_SEC)
-
+        await asyncio.sleep(ENTRY_SCAN_SEC)
 
 # =========================
 # Main
@@ -682,8 +762,9 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     async def post_init(app_: Application):
-        app_.create_task(scanner_loop(app_))
-        await app_.bot.send_message(chat_id=ALLOWED_USER_ID, text=f"✅ Approval bot started | TF={INTERVAL} | MODE={SYMBOL_MODE}")
+        app_.create_task(entry_scanner(app_))
+        app_.create_task(monitor_positions(app_))
+        await tg_send(app_, f"✅ Bot started | TF={INTERVAL} | BUY=ruxsat | SELL=avtomat | entry_scan={ENTRY_SCAN_SEC}s | pos_poll={POS_POLL_SEC}s")
 
     app.post_init = post_init
     app.run_polling(drop_pending_updates=True)
