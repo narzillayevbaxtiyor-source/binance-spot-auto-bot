@@ -58,12 +58,12 @@ DEFAULT_RISK = float(os.getenv("DEFAULT_RISK") or "0.10")
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "1"))  # 100$ uchun 1 juda yaxshi
 
 # Risk logic
-SL_OFFSET = float(os.getenv("SL_OFFSET") or "0.001")      # 0.1% = 0.001 (sen aytgandek)
-BE_TRIGGER = float(os.getenv("BE_TRIGGER") or "0.0")      # xohlasang 0.0015 qoldir, 0 bo'lsa BE ishlamaydi
+SL_OFFSET = float(os.getenv("SL_OFFSET") or "0.001")      # 0.1% = 0.001
+BE_TRIGGER = float(os.getenv("BE_TRIGGER") or "0.0")      # 0 bo'lsa BE ishlamaydi
 
-# Filters (make-high va pullback sifatini tozalash uchun)
-MIN_GREEN_RUN = int(os.getenv("MIN_GREEN_RUN", "2"))         # make-high uchun min yashil sham
-MIN_PULLBACK_REDS = int(os.getenv("MIN_PULLBACK_REDS", "1")) # pullbackda min qizil sham (xohlasang 2)
+# Filters
+MIN_GREEN_RUN = int(os.getenv("MIN_GREEN_RUN", "2"))
+MIN_PULLBACK_REDS = int(os.getenv("MIN_PULLBACK_REDS", "1"))
 
 # Approval
 APPROVE_TIMEOUT_SEC = int(os.getenv("APPROVE_TIMEOUT_SEC") or "120")
@@ -99,6 +99,13 @@ def http_get_json(path: str, params: Optional[dict] = None, timeout: int = 12):
         except Exception as e:
             last_err = e
     raise RuntimeError(f"All Binance endpoints failed: {path}. Last error: {last_err}")
+
+
+# =========================
+# Async wrappers (IMPORTANT: don't block PTB event loop)
+# =========================
+async def a_http_get_json(path: str, params: Optional[dict] = None, timeout: int = 12):
+    return await asyncio.to_thread(http_get_json, path, params, timeout)
 
 
 # =========================
@@ -210,6 +217,20 @@ def get_spot_price(symbol: str) -> float:
     return safe_float(data.get("price", 0))
 
 
+# Async wrappers for public
+async def a_get_exchange_info_symbols_usdt():
+    return await asyncio.to_thread(get_exchange_info_symbols_usdt)
+
+async def a_get_top10_gainers_usdt(tradable_usdt: set):
+    return await asyncio.to_thread(get_top10_gainers_usdt, tradable_usdt)
+
+async def a_get_klines(symbol: str, interval: str, limit: int):
+    return await asyncio.to_thread(get_klines, symbol, interval, limit)
+
+async def a_get_spot_price(symbol: str):
+    return await asyncio.to_thread(get_spot_price, symbol)
+
+
 # =========================
 # Binance signed
 # =========================
@@ -295,6 +316,16 @@ def place_market_order(symbol: str, side: str, quantity: float) -> dict:
     }
     return signed_request("POST", "/api/v3/order", params)
 
+# Async wrappers for signed
+async def a_compute_qty(symbol: str, price: float, size_mode: str, usdt_amount: float, risk_pct: float):
+    return await asyncio.to_thread(compute_qty, symbol, price, size_mode, usdt_amount, risk_pct)
+
+async def a_place_market_order(symbol: str, side: str, qty: float):
+    return await asyncio.to_thread(place_market_order, symbol, side, qty)
+
+async def a_get_free_balance(asset: str):
+    return await asyncio.to_thread(get_free_balance, asset)
+
 
 # =========================
 # Telegram helpers
@@ -345,24 +376,18 @@ async def send_approval(app: Application, payload: dict):
 
 
 # =========================
-# Strategy state (SENING USUL: yopilgan sham + wick cross)
+# Strategy state
 # =========================
 @dataclass
 class SymbolState:
-    stage: str = "SEEK_MAKEHIGH_START"  # SEEK -> GREEN_RUN -> WAIT_PULLBACK_BREAK -> PULLBACK -> WAIT_BUY_BREAK -> WAIT_APPROVAL
-
+    stage: str = "SEEK_MAKEHIGH_START"
     green_run_count: int = 0
-
-    # "turn red candle" low (make-high tugashi uchun)
     turn_red_low: float = 0.0
     turn_red_close_time: int = 0
-
-    # pullback monitoring: oxirgi yopilgan sham (pullbackdagi)
     pullback_red_count: int = 0
     last_pullback_close_time: int = 0
     last_pullback_high: float = 0.0
     last_pullback_low: float = 0.0
-
     last_signal: str = ""
 
 def ensure_symbol_state(state: dict, symbol: str) -> SymbolState:
@@ -379,25 +404,18 @@ def update_symbol_state_dict(state: dict, symbol: str, st: SymbolState) -> None:
     state["symbols"][symbol] = asdict(st)
 
 def analyze_buy_setup(symbol: str, st: SymbolState, klines: List[dict], price: float) -> Tuple[SymbolState, Optional[dict]]:
-    """
-    MUHIM:
-    - Reference candles: faqat YOPILGAN shamlar (last_closed = klines[-2])
-    - Trigger: narx sham SOYASI (high/low) ni kesib o‘tishi
-    """
     if len(klines) < 6:
         return st, None
 
-    last_closed = klines[-2]  # yopilgan
-    prev_closed = klines[-3]  # yopilgan
+    last_closed = klines[-2]
+    prev_closed = klines[-3]
 
     def sig_key(kind: str, t: int) -> str:
         return f"{kind}:{t}"
 
-    # Approval kutayotgan bo'lsa yangisini qidirmaymiz (spam bo'lmasin)
     if st.stage == "WAIT_APPROVAL":
         return st, None
 
-    # 1) Make-high start: qizil -> yashil
     if st.stage == "SEEK_MAKEHIGH_START":
         st.green_run_count = 0
         st.pullback_red_count = 0
@@ -407,25 +425,19 @@ def analyze_buy_setup(symbol: str, st: SymbolState, klines: List[dict], price: f
             st.green_run_count = 1
         return st, None
 
-    # 2) GREEN_RUN: yashil shamlar ketma-ketligi
     if st.stage == "GREEN_RUN":
         if is_green(last_closed):
             st.green_run_count += 1
             return st, None
 
-        # green ketma-ketlikdan keyin qizil sham paydo bo'ldi (turn red)
         if is_red(last_closed):
-            # make-high haqiqiy bo'lishi uchun min yashil run
             if st.green_run_count < MIN_GREEN_RUN:
                 return SymbolState(), None
-
             st.turn_red_low = float(last_closed["low"])
             st.turn_red_close_time = int(last_closed["close_time"])
             st.stage = "WAIT_PULLBACK_BREAK"
         return st, None
 
-    # 3) WAIT_PULLBACK_BREAK: pullback boshlanishi
-    # SEN aytgan: narx turn-red shamning LOW soyasini kesib o'tsa (pastga) -> pullback start
     if st.stage == "WAIT_PULLBACK_BREAK":
         if st.turn_red_low > 0 and price < st.turn_red_low:
             st.stage = "PULLBACK_BEARISH"
@@ -433,9 +445,6 @@ def analyze_buy_setup(symbol: str, st: SymbolState, klines: List[dict], price: f
             st.last_pullback_close_time = 0
             st.last_pullback_high = 0.0
             st.last_pullback_low = 0.0
-
-            # pullbackdagi oxirgi yopilgan shamni tracking qilish
-            # (pullback boshlanganda last_closed qizil bo'lishi mumkin)
             if is_red(last_closed):
                 st.pullback_red_count = 1
                 st.last_pullback_close_time = int(last_closed["close_time"])
@@ -443,10 +452,7 @@ def analyze_buy_setup(symbol: str, st: SymbolState, klines: List[dict], price: f
                 st.last_pullback_low = float(last_closed["low"])
         return st, None
 
-    # 4) PULLBACK_BEARISH: tushuvchi shamlar ketma-ketligi
-    # Sen aytgan: pullbackdagi oxirgi yopilgan shamning MAX (HIGH wick) ni narx kesib o'tsa BUY
     if st.stage == "PULLBACK_BEARISH":
-        # pullbackda qizil shamlar ketma-ketligi bo'lsa oxirgisini yangilaymiz
         if is_red(last_closed):
             st.pullback_red_count += 1
             st.last_pullback_close_time = int(last_closed["close_time"])
@@ -454,18 +460,13 @@ def analyze_buy_setup(symbol: str, st: SymbolState, klines: List[dict], price: f
             st.last_pullback_low = float(last_closed["low"])
             return st, None
 
-        # pullback ichida yashil sham yopildi — endi BUY break kutamiz
         if is_green(last_closed):
-            # pullback minimal sifati
             if st.pullback_red_count < MIN_PULLBACK_REDS or st.last_pullback_high <= 0:
                 return SymbolState(), None
             st.stage = "WAIT_BUY_BREAK"
         return st, None
 
-    # 5) WAIT_BUY_BREAK: BUY trigger (wick cross)
-    # Trigger: current price > last CLOSED pullback candle HIGH (soya)
     if st.stage == "WAIT_BUY_BREAK":
-        # agar yana qizil yopilsa -> pullback davom etyapti
         if is_red(last_closed):
             st.stage = "PULLBACK_BEARISH"
             st.pullback_red_count = max(st.pullback_red_count, 1)
@@ -480,7 +481,6 @@ def analyze_buy_setup(symbol: str, st: SymbolState, klines: List[dict], price: f
                 return st, None
             st.last_signal = key
 
-            # SL: pullbackdagi oxirgi yopilgan sham LOWidan 0.1% past (SL_OFFSET)
             sl = st.last_pullback_low * (1.0 - SL_OFFSET)
 
             payload = {
@@ -491,8 +491,6 @@ def analyze_buy_setup(symbol: str, st: SymbolState, klines: List[dict], price: f
                 "ts": now_ts(),
                 "interval": INTERVAL,
             }
-
-            # Approval kutamiz, reset qilmaymiz
             st.stage = "WAIT_APPROVAL"
             return st, payload
 
@@ -500,27 +498,26 @@ def analyze_buy_setup(symbol: str, st: SymbolState, klines: List[dict], price: f
 
 
 # =========================
-# Exit logic (SELL avtomat) — yopilgan yashil sham LOW wick break
+# Exit logic (SELL auto)
 # =========================
 async def update_trailing_low_from_last_closed_green(symbol: str, pos: dict) -> dict:
-    """
-    SELL sharti:
-    - o'suvchi shamlar ketma-ketligida oxirgi YOPILGAN yashil shamning LOW soyasi
-    - narx shu LOW dan pastga ketsa -> SELL
-    """
     try:
-        kl = get_klines(symbol, INTERVAL, 20)
-        # Oxirgi yopilgan sham
+        kl = await a_get_klines(symbol, INTERVAL, 20)
         last_closed = kl[-2]
         ct = int(last_closed["close_time"])
-
-        # faqat yashil yopilgan sham bo'lsa trail_low yangilaymiz
         if is_green(last_closed) and ct != int(pos.get("last_green_close_time", 0)):
             pos["last_green_close_time"] = ct
             pos["trail_low"] = float(last_closed["low"])
     except Exception:
         pass
     return pos
+
+async def do_sell_and_notify(app: Application, sym: str, qty: float, text: str):
+    try:
+        await a_place_market_order(sym, "SELL", qty)
+        await tg_send(app, text)
+    except Exception as e:
+        await tg_send(app, f"⚠️ SELL FAILED {sym}: {e}")
 
 async def monitor_positions(app: Application):
     while True:
@@ -534,20 +531,17 @@ async def monitor_positions(app: Application):
 
         for sym, pos in list(positions.items()):
             try:
-                price = get_spot_price(sym)
+                price = await a_get_spot_price(sym)
 
                 entry = float(pos.get("entry", 0.0))
                 sl = float(pos.get("sl", 0.0))
 
-                # Break-even optional
                 if BE_TRIGGER > 0 and entry > 0 and (not pos.get("be_on", False)) and price >= entry * (1.0 + BE_TRIGGER):
                     pos["sl"] = entry
                     pos["be_on"] = True
                     changed = True
                     await tg_send(app, f"🟡 BE ON\n{sym}\nSL -> entry {fmt(entry)}")
 
-                # trail_low yangilash (yopilgan yashil shamdan)
-                # tez chiqish uchun har ENTRY_SCAN_SEC atrofida klines olamiz
                 if (now_ts() - int(pos.get("last_trail_update_ts", 0))) >= max(int(ENTRY_SCAN_SEC), 8):
                     pos["last_trail_update_ts"] = now_ts()
                     pos = await update_trailing_low_from_last_closed_green(sym, pos)
@@ -556,20 +550,19 @@ async def monitor_positions(app: Application):
 
                 trail_low = float(pos.get("trail_low", 0.0))
 
-                # 1) SL tez chiqish
                 if sl > 0 and price <= sl:
                     qty = float(pos.get("qty", 0.0))
-                    place_market_order(sym, "SELL", qty)
-                    await tg_send(app, f"🟥 SL SELL\n{sym}\nPrice: {fmt(price)}\nSL: {fmt(sl)}")
+                    st_text = f"🟥 SL SELL\n{sym}\nPrice: {fmt(price)}\nSL: {fmt(sl)}"
+                    # background sell
+                    asyncio.create_task(do_sell_and_notify(app, sym, qty, st_text))
                     positions.pop(sym, None)
                     changed = True
                     continue
 
-                # 2) SELL (TP) — oxirgi yopilgan yashil sham LOW soyasi kesilsa
                 if trail_low > 0 and price < trail_low:
                     qty = float(pos.get("qty", 0.0))
-                    place_market_order(sym, "SELL", qty)
-                    await tg_send(app, f"🟩 SELL (LOW break)\n{sym}\nPrice: {fmt(price)}\nLast green LOW: {fmt(trail_low)}")
+                    st_text = f"🟩 SELL (LOW break)\n{sym}\nPrice: {fmt(price)}\nLast green LOW: {fmt(trail_low)}"
+                    asyncio.create_task(do_sell_and_notify(app, sym, qty, st_text))
                     positions.pop(sym, None)
                     changed = True
                     continue
@@ -591,7 +584,7 @@ async def entry_scanner(app: Application):
     state = load_state()
     tradable_usdt = set()
     try:
-        tradable_usdt = get_exchange_info_symbols_usdt()
+        tradable_usdt = await a_get_exchange_info_symbols_usdt()
     except Exception as e:
         await tg_send(app, f"⚠️ exchangeInfo error: {e}")
 
@@ -603,14 +596,12 @@ async def entry_scanner(app: Application):
             prefs = get_prefs(state)
             positions = state.get("positions", {}) or {}
 
-            # TOP10 refresh
             if SYMBOL_MODE == "TOP10":
                 if now_ts() - int(state.get("last_top_refresh", 0)) >= TOP_REFRESH_SEC or not top10:
-                    top10 = get_top10_gainers_usdt(tradable_usdt)
+                    top10 = await a_get_top10_gainers_usdt(tradable_usdt)
                     state["top10"] = top10
                     state["last_top_refresh"] = now_ts()
 
-                    # removed cleanup
                     for sym in list(state.get("symbols", {}).keys()):
                         if sym not in top10:
                             state["symbols"].pop(sym, None)
@@ -620,20 +611,16 @@ async def entry_scanner(app: Application):
             else:
                 symbols = SYMBOLS[:]
 
-            # Scan symbols
             for sym in symbols:
-                # 1 coin = 1 position
                 if sym in positions:
                     continue
-
-                # position limit (100$ uchun muhim)
                 if len(positions) >= MAX_OPEN_POSITIONS:
                     break
 
                 st_sym = ensure_symbol_state(state, sym)
 
-                kl = get_klines(sym, INTERVAL, KLINE_LIMIT)
-                price = get_spot_price(sym)
+                kl = await a_get_klines(sym, INTERVAL, KLINE_LIMIT)
+                price = await a_get_spot_price(sym)
 
                 st_sym, payload = analyze_buy_setup(sym, st_sym, kl, price)
                 update_symbol_state_dict(state, sym, st_sym)
@@ -684,121 +671,163 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg)
 
+async def do_buy_and_reply(q, context: ContextTypes.DEFAULT_TYPE, oid: str, mode_arg: str):
+    # reload state inside task (safer)
+    st = load_state()
+    pending = st.get("pending", {}) or {}
+    positions = st.get("positions", {}) or {}
+    prefs = get_prefs(st)
+
+    p = pending.get(oid)
+    if not p:
+        try:
+            await q.edit_message_text("⚠️ Eskirgan yoki topilmadi.")
+        except Exception:
+            pass
+        return
+
+    symbol = p["symbol"]
+
+    if now_ts() - int(p.get("ts", 0)) > APPROVE_TIMEOUT_SEC:
+        pending.pop(oid, None)
+        st["pending"] = pending
+        st["symbols"][symbol] = asdict(SymbolState())
+        save_state(st)
+        try:
+            await q.edit_message_text("⌛ Timeout. Bekor bo‘ldi.")
+        except Exception:
+            pass
+        return
+
+    if len(positions) >= MAX_OPEN_POSITIONS:
+        pending.pop(oid, None)
+        st["pending"] = pending
+        st["symbols"][symbol] = asdict(SymbolState())
+        save_state(st)
+        try:
+            await q.edit_message_text(f"⚠️ Limit: MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS}.")
+        except Exception:
+            pass
+        return
+
+    if symbol in positions:
+        pending.pop(oid, None)
+        st["pending"] = pending
+        st["symbols"][symbol] = asdict(SymbolState())
+        save_state(st)
+        try:
+            await q.edit_message_text("⚠️ Bu coinda allaqachon pozitsiya bor.")
+        except Exception:
+            pass
+        return
+
+    size_mode = prefs["size_mode"]
+    usdt_amt = float(prefs["default_usdt"])
+    risk_pct = float(prefs["default_risk"])
+
+    if mode_arg.startswith("USDT:"):
+        size_mode = "USDT"
+        usdt_amt = safe_float(mode_arg.split(":", 1)[1]) or usdt_amt
+
+    sl = float(p["sl"])
+
+    try:
+        price = await a_get_spot_price(symbol)
+        qty = await a_compute_qty(symbol, price, size_mode, usdt_amt, risk_pct)
+        await a_place_market_order(symbol, "BUY", qty)
+
+        positions[symbol] = {
+            "qty": qty,
+            "entry": price,
+            "sl": sl,
+            "be_on": False,
+            "trail_low": 0.0,
+            "last_green_close_time": 0,
+            "last_trail_update_ts": 0,
+            "opened_ts": now_ts(),
+        }
+
+        pending.pop(oid, None)
+        st["pending"] = pending
+        st["positions"] = positions
+        st["symbols"][symbol] = asdict(SymbolState())
+        save_state(st)
+
+        try:
+            await q.edit_message_text(
+                f"✅ BUY EXECUTED\n{symbol}\n"
+                f"Qty: {qty}\n"
+                f"Entry: {fmt(price)}\n"
+                f"SL: {fmt(sl)}\n"
+                f"SELL: last closed green LOW wick break\n"
+            )
+        except Exception:
+            pass
+
+    except Exception as e:
+        pending.pop(oid, None)
+        st["pending"] = pending
+        st["symbols"][symbol] = asdict(SymbolState())
+        save_state(st)
+        try:
+            await q.edit_message_text(f"⚠️ BUY FAILED: {e}")
+        except Exception:
+            pass
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
-    await q.answer()
+
+    # ACK immediately
+    try:
+        await q.answer("⏳ Qabul qilindi...")
+    except Exception:
+        try:
+            await q.answer()
+        except Exception:
+            pass
 
     if ALLOWED_USER_ID and q.from_user and q.from_user.id != ALLOWED_USER_ID:
-        await q.edit_message_text("⛔ Ruxsat yo‘q.")
+        try:
+            await q.edit_message_text("⛔ Ruxsat yo‘q.")
+        except Exception:
+            pass
         return
 
     parts = (q.data or "").split("|")
     if not parts:
         return
 
-    st = load_state()
-    pending = st.get("pending", {}) or {}
-    positions = st.get("positions", {}) or {}
-    prefs = get_prefs(st)
-
+    # REJECT fast
     if parts[0] == "REJECT":
         oid = parts[1] if len(parts) > 1 else ""
+        st = load_state()
+        pending = st.get("pending", {}) or {}
         payload = pending.pop(oid, None)
         st["pending"] = pending
-
-        # ✅ rejection bo'lsa symbol state reset (yana yangi setup qidiradi)
         if payload and payload.get("symbol"):
             st["symbols"][payload["symbol"]] = asdict(SymbolState())
-
         save_state(st)
-        await q.edit_message_text("❌ Bekor qilindi.")
+        try:
+            await q.edit_message_text("❌ Bekor qilindi.")
+        except Exception:
+            pass
         return
 
     if parts[0] == "APPROVE":
         oid = parts[1] if len(parts) > 1 else ""
         mode_arg = parts[2] if len(parts) > 2 else "DEF"
 
-        p = pending.get(oid)
-        if not p:
-            await q.edit_message_text("⚠️ Eskirgan yoki topilmadi.")
-            return
-
-        if now_ts() - int(p.get("ts", 0)) > APPROVE_TIMEOUT_SEC:
-            pending.pop(oid, None)
-            st["pending"] = pending
-            st["symbols"][p["symbol"]] = asdict(SymbolState())
-            save_state(st)
-            await q.edit_message_text("⌛ Timeout. Bekor bo‘ldi.")
-            return
-
-        if len(positions) >= MAX_OPEN_POSITIONS:
-            pending.pop(oid, None)
-            st["pending"] = pending
-            st["symbols"][p["symbol"]] = asdict(SymbolState())
-            save_state(st)
-            await q.edit_message_text(f"⚠️ Limit: MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS}.")
-            return
-
-        symbol = p["symbol"]
-        if symbol in positions:
-            pending.pop(oid, None)
-            st["pending"] = pending
-            st["symbols"][symbol] = asdict(SymbolState())
-            save_state(st)
-            await q.edit_message_text("⚠️ Bu coinda allaqachon pozitsiya bor.")
-            return
-
-        size_mode = prefs["size_mode"]
-        usdt_amt = float(prefs["default_usdt"])
-        risk_pct = float(prefs["default_risk"])
-
-        if mode_arg.startswith("USDT:"):
-            size_mode = "USDT"
-            usdt_amt = safe_float(mode_arg.split(":", 1)[1]) or usdt_amt
-
-        price = get_spot_price(symbol)  # aktual
-        sl = float(p["sl"])
-
+        # quick UI update (so Telegram won't think it's stuck)
         try:
-            qty = compute_qty(symbol, price, size_mode, usdt_amt, risk_pct)
-            place_market_order(symbol, "BUY", qty)
+            await q.edit_message_text("⏳ Order yuborilyapti...")
+        except Exception:
+            pass
 
-            positions[symbol] = {
-                "qty": qty,
-                "entry": price,
-                "sl": sl,
-                "be_on": False,
-                "trail_low": 0.0,                  # oxirgi yopilgan yashil sham LOW
-                "last_green_close_time": 0,
-                "last_trail_update_ts": 0,
-                "opened_ts": now_ts(),
-            }
-
-            pending.pop(oid, None)
-            st["pending"] = pending
-            st["positions"] = positions
-
-            # ✅ BUY qilingandan keyin symbol state reset
-            st["symbols"][symbol] = asdict(SymbolState())
-
-            save_state(st)
-
-            await q.edit_message_text(
-                f"✅ BUY EXECUTED\n{symbol}\n"
-                f"Qty: {qty}\n"
-                f"Entry: {fmt(price)}\n"
-                f"SL (last pullback LOW - {SL_OFFSET*100:.2f}%): {fmt(sl)}\n"
-                f"SELL: last closed green LOW wick break\n"
-            )
-        except Exception as e:
-            await q.edit_message_text(f"⚠️ BUY FAILED: {e}")
-            # state reset
-            pending.pop(oid, None)
-            st["pending"] = pending
-            st["symbols"][symbol] = asdict(SymbolState())
-            save_state(st)
+        # run BUY in background (no blocking)
+        context.application.create_task(do_buy_and_reply(q, context, oid, mode_arg))
         return
 
 
@@ -822,7 +851,7 @@ def main():
     async def post_init(app_: Application):
         app_.create_task(entry_scanner(app_))
         app_.create_task(monitor_positions(app_))
-        await tg_send(app_, f"✅ START | TF={INTERVAL} | BUY=approval | SELL=auto | wick-cross (closed candles)")
+        await tg_send(app_, f"✅ START | TF={INTERVAL} | BUY=approval | SELL=auto | non-blocking callbacks")
 
     app.post_init = post_init
     app.run_polling(drop_pending_updates=True)
