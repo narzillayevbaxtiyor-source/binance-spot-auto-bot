@@ -19,7 +19,7 @@ BINANCE_API_KEY = (os.getenv("BINANCE_API_KEY") or "").strip()
 BINANCE_API_SECRET = (os.getenv("BINANCE_API_SECRET") or "").strip()
 
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
-ALLOWED_USER_ID = int((os.getenv("ALLOWED_USER_ID") or "0").strip() or "0")  # approve faqat shu user
+ALLOWED_USER_ID = int((os.getenv("ALLOWED_USER_ID") or "0").strip() or "0")
 
 # =========================
 # Binance endpoints (fallback)
@@ -43,33 +43,30 @@ QUOTE_ASSET = (os.getenv("QUOTE_ASSET") or "USDT").strip().upper()
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "200"))
 TOP_REFRESH_SEC = int(os.getenv("TOP_REFRESH_SEC", "180"))
 
-ENTRY_SCAN_SEC = float(os.getenv("ENTRY_SCAN_SEC", "12"))  # klines refresh
-POS_POLL_SEC = float(os.getenv("POS_POLL_SEC", "1"))       # position price monitor
+ENTRY_SCAN_SEC = float(os.getenv("ENTRY_SCAN_SEC", "12"))
+POS_POLL_SEC = float(os.getenv("POS_POLL_SEC", "1"))
 
-# Universe
 SYMBOL_MODE = (os.getenv("SYMBOL_MODE") or "TOP10").strip().upper()  # TOP10 or LIST
 SYMBOLS = [s.strip().upper() for s in (os.getenv("SYMBOLS") or "").split(",") if s.strip()]
 
-# Position sizing
 SIZE_MODE = (os.getenv("SIZE_MODE") or "USDT").strip().upper()  # USDT or RISK
 DEFAULT_USDT = float(os.getenv("DEFAULT_USDT") or "10")
 DEFAULT_RISK = float(os.getenv("DEFAULT_RISK") or "0.10")
 
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "1"))  # 100$ uchun 1 juda yaxshi
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
 
-# Risk logic
 SL_OFFSET = float(os.getenv("SL_OFFSET") or "0.001")      # 0.1% = 0.001
-BE_TRIGGER = float(os.getenv("BE_TRIGGER") or "0.0")      # 0 bo'lsa BE ishlamaydi
+BE_TRIGGER = float(os.getenv("BE_TRIGGER") or "0.0")
 
-# Filters
 MIN_GREEN_RUN = int(os.getenv("MIN_GREEN_RUN", "2"))
 MIN_PULLBACK_REDS = int(os.getenv("MIN_PULLBACK_REDS", "1"))
 
-# Approval
 APPROVE_TIMEOUT_SEC = int(os.getenv("APPROVE_TIMEOUT_SEC") or "120")
 MAX_PENDING = int(os.getenv("MAX_PENDING") or "25")
 
+# Optional state snapshot (not required, but useful)
 STATE_FILE = os.getenv("STATE_FILE") or "state.json"
+STATE_SNAPSHOT_SEC = int(os.getenv("STATE_SNAPSHOT_SEC") or "60")  # set 0 to disable
 
 
 # =========================
@@ -102,50 +99,55 @@ def http_get_json(path: str, params: Optional[dict] = None, timeout: int = 12):
 
 
 # =========================
-# Async wrappers (IMPORTANT: don't block PTB event loop)
+# In-memory STATE (NO RACE)
 # =========================
-async def a_http_get_json(path: str, params: Optional[dict] = None, timeout: int = 12):
-    return await asyncio.to_thread(http_get_json, path, params, timeout)
+STATE_LOCK = asyncio.Lock()
 
-
-# =========================
-# State
-# =========================
-def load_state() -> dict:
-    if not os.path.exists(STATE_FILE):
-        return {
-            "symbols": {},
-            "top10": [],
-            "last_top_refresh": 0,
-            "pending": {},
-            "positions": {},
-            "prefs": {
-                "size_mode": SIZE_MODE,
-                "default_usdt": DEFAULT_USDT,
-                "default_risk": DEFAULT_RISK,
-            }
+def _default_state() -> dict:
+    return {
+        "symbols": {},
+        "top10": [],
+        "last_top_refresh": 0,
+        "pending": {},    # oid -> payload
+        "positions": {},  # symbol -> pos
+        "prefs": {
+            "size_mode": SIZE_MODE,
+            "default_usdt": DEFAULT_USDT,
+            "default_risk": DEFAULT_RISK,
         }
+    }
+
+STATE: dict = _default_state()
+
+def _load_state_file_once():
+    global STATE
+    if not STATE_FILE:
+        return
+    if not os.path.exists(STATE_FILE):
+        return
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        # merge carefully
+        base = _default_state()
+        for k in base.keys():
+            if k in data:
+                base[k] = data[k]
+        # ensure prefs keys
+        base.setdefault("prefs", {})
+        base["prefs"].setdefault("size_mode", SIZE_MODE)
+        base["prefs"].setdefault("default_usdt", DEFAULT_USDT)
+        base["prefs"].setdefault("default_risk", DEFAULT_RISK)
+        STATE = base
     except Exception:
-        return {
-            "symbols": {},
-            "top10": [],
-            "last_top_refresh": 0,
-            "pending": {},
-            "positions": {},
-            "prefs": {
-                "size_mode": SIZE_MODE,
-                "default_usdt": DEFAULT_USDT,
-                "default_risk": DEFAULT_RISK,
-            }
-        }
+        STATE = _default_state()
 
-def save_state(state: dict) -> None:
+def _save_state_file_snapshot():
+    if not STATE_FILE:
+        return
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+        json.dump(STATE, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_FILE)
 
 def get_prefs(state: dict) -> dict:
@@ -181,7 +183,7 @@ def is_red(c: dict) -> bool:
 
 
 # =========================
-# Binance public
+# Binance public (sync)
 # =========================
 def get_exchange_info_symbols_usdt() -> set:
     data = http_get_json("/api/v3/exchangeInfo")
@@ -216,8 +218,7 @@ def get_spot_price(symbol: str) -> float:
     data = http_get_json("/api/v3/ticker/price", params={"symbol": symbol})
     return safe_float(data.get("price", 0))
 
-
-# Async wrappers for public
+# async wrappers (non-blocking)
 async def a_get_exchange_info_symbols_usdt():
     return await asyncio.to_thread(get_exchange_info_symbols_usdt)
 
@@ -232,7 +233,7 @@ async def a_get_spot_price(symbol: str):
 
 
 # =========================
-# Binance signed
+# Binance signed (sync)
 # =========================
 def sign_query(params: Dict) -> str:
     qs = urllib.parse.urlencode(params, doseq=True)
@@ -316,15 +317,12 @@ def place_market_order(symbol: str, side: str, quantity: float) -> dict:
     }
     return signed_request("POST", "/api/v3/order", params)
 
-# Async wrappers for signed
+# async wrappers
 async def a_compute_qty(symbol: str, price: float, size_mode: str, usdt_amount: float, risk_pct: float):
     return await asyncio.to_thread(compute_qty, symbol, price, size_mode, usdt_amount, risk_pct)
 
 async def a_place_market_order(symbol: str, side: str, qty: float):
     return await asyncio.to_thread(place_market_order, symbol, side, qty)
-
-async def a_get_free_balance(asset: str):
-    return await asyncio.to_thread(get_free_balance, asset)
 
 
 # =========================
@@ -353,15 +351,14 @@ def build_keyboard(order_id: str) -> InlineKeyboardMarkup:
     ])
 
 async def send_approval(app: Application, payload: dict):
-    st = load_state()
-    pending = st.get("pending", {}) or {}
-    if len(pending) >= MAX_PENDING:
-        return
-
-    oid = make_order_id()
-    pending[oid] = payload
-    st["pending"] = pending
-    save_state(st)
+    # pending state is protected by lock -> never disappears
+    async with STATE_LOCK:
+        pending = STATE.get("pending", {}) or {}
+        if len(pending) >= MAX_PENDING:
+            return
+        oid = make_order_id()
+        pending[oid] = payload
+        STATE["pending"] = pending
 
     txt = (
         f"📣 BUY setup (ruxsat kerak)\n"
@@ -371,12 +368,13 @@ async def send_approval(app: Application, payload: dict):
         f"Break HIGH: {fmt(payload['break_high'])}\n"
         f"Price: {fmt(payload['price'])}\n"
         f"SL: {fmt(payload['sl'])}\n"
+        f"(Timeout: {APPROVE_TIMEOUT_SEC}s)\n"
     )
     await app.bot.send_message(chat_id=ALLOWED_USER_ID, text=txt, reply_markup=build_keyboard(oid))
 
 
 # =========================
-# Strategy state
+# Strategy state (your logic)
 # =========================
 @dataclass
 class SymbolState:
@@ -390,18 +388,21 @@ class SymbolState:
     last_pullback_low: float = 0.0
     last_signal: str = ""
 
-def ensure_symbol_state(state: dict, symbol: str) -> SymbolState:
-    s = state["symbols"].get(symbol)
+def ensure_symbol_state(symbol: str) -> SymbolState:
+    s = (STATE.get("symbols", {}) or {}).get(symbol)
     if not s:
         st = SymbolState()
-        state["symbols"][symbol] = asdict(st)
+        STATE.setdefault("symbols", {})[symbol] = asdict(st)
         return st
     st = SymbolState(**{**asdict(SymbolState()), **s})
-    state["symbols"][symbol] = asdict(st)
+    STATE.setdefault("symbols", {})[symbol] = asdict(st)
     return st
 
-def update_symbol_state_dict(state: dict, symbol: str, st: SymbolState) -> None:
-    state["symbols"][symbol] = asdict(st)
+def set_symbol_state(symbol: str, st: SymbolState) -> None:
+    STATE.setdefault("symbols", {})[symbol] = asdict(st)
+
+def reset_symbol(symbol: str) -> None:
+    STATE.setdefault("symbols", {})[symbol] = asdict(SymbolState())
 
 def analyze_buy_setup(symbol: str, st: SymbolState, klines: List[dict], price: float) -> Tuple[SymbolState, Optional[dict]]:
     if len(klines) < 6:
@@ -482,7 +483,6 @@ def analyze_buy_setup(symbol: str, st: SymbolState, klines: List[dict], price: f
             st.last_signal = key
 
             sl = st.last_pullback_low * (1.0 - SL_OFFSET)
-
             payload = {
                 "symbol": symbol,
                 "price": price,
@@ -521,13 +521,15 @@ async def do_sell_and_notify(app: Application, sym: str, qty: float, text: str):
 
 async def monitor_positions(app: Application):
     while True:
-        st = load_state()
-        positions = st.get("positions", {}) or {}
+        async with STATE_LOCK:
+            positions = dict(STATE.get("positions", {}) or {})
+
         if not positions:
             await asyncio.sleep(POS_POLL_SEC)
             continue
 
         changed = False
+        new_positions = dict(positions)
 
         for sym, pos in list(positions.items()):
             try:
@@ -536,34 +538,37 @@ async def monitor_positions(app: Application):
                 entry = float(pos.get("entry", 0.0))
                 sl = float(pos.get("sl", 0.0))
 
+                # Break-even optional
                 if BE_TRIGGER > 0 and entry > 0 and (not pos.get("be_on", False)) and price >= entry * (1.0 + BE_TRIGGER):
                     pos["sl"] = entry
                     pos["be_on"] = True
                     changed = True
                     await tg_send(app, f"🟡 BE ON\n{sym}\nSL -> entry {fmt(entry)}")
 
+                # trail update occasionally
                 if (now_ts() - int(pos.get("last_trail_update_ts", 0))) >= max(int(ENTRY_SCAN_SEC), 8):
                     pos["last_trail_update_ts"] = now_ts()
                     pos = await update_trailing_low_from_last_closed_green(sym, pos)
-                    positions[sym] = pos
+                    new_positions[sym] = pos
                     changed = True
 
                 trail_low = float(pos.get("trail_low", 0.0))
 
+                # SL
                 if sl > 0 and price <= sl:
                     qty = float(pos.get("qty", 0.0))
-                    st_text = f"🟥 SL SELL\n{sym}\nPrice: {fmt(price)}\nSL: {fmt(sl)}"
-                    # background sell
-                    asyncio.create_task(do_sell_and_notify(app, sym, qty, st_text))
-                    positions.pop(sym, None)
+                    text = f"🟥 SL SELL\n{sym}\nPrice: {fmt(price)}\nSL: {fmt(sl)}"
+                    asyncio.create_task(do_sell_and_notify(app, sym, qty, text))
+                    new_positions.pop(sym, None)
                     changed = True
                     continue
 
+                # SELL on last green low break
                 if trail_low > 0 and price < trail_low:
                     qty = float(pos.get("qty", 0.0))
-                    st_text = f"🟩 SELL (LOW break)\n{sym}\nPrice: {fmt(price)}\nLast green LOW: {fmt(trail_low)}"
-                    asyncio.create_task(do_sell_and_notify(app, sym, qty, st_text))
-                    positions.pop(sym, None)
+                    text = f"🟩 SELL (LOW break)\n{sym}\nPrice: {fmt(price)}\nLast green LOW: {fmt(trail_low)}"
+                    asyncio.create_task(do_sell_and_notify(app, sym, qty, text))
+                    new_positions.pop(sym, None)
                     changed = True
                     continue
 
@@ -571,8 +576,8 @@ async def monitor_positions(app: Application):
                 await tg_send(app, f"⚠️ position monitor error {sym}: {e}")
 
         if changed:
-            st["positions"] = positions
-            save_state(st)
+            async with STATE_LOCK:
+                STATE["positions"] = new_positions
 
         await asyncio.sleep(POS_POLL_SEC)
 
@@ -581,59 +586,76 @@ async def monitor_positions(app: Application):
 # Entry scanner
 # =========================
 async def entry_scanner(app: Application):
-    state = load_state()
     tradable_usdt = set()
     try:
         tradable_usdt = await a_get_exchange_info_symbols_usdt()
     except Exception as e:
         await tg_send(app, f"⚠️ exchangeInfo error: {e}")
 
-    top10 = state.get("top10", []) or []
-
     while True:
         try:
-            state = load_state()
-            prefs = get_prefs(state)
-            positions = state.get("positions", {}) or {}
-
+            # refresh top10 if needed
             if SYMBOL_MODE == "TOP10":
-                if now_ts() - int(state.get("last_top_refresh", 0)) >= TOP_REFRESH_SEC or not top10:
-                    top10 = await a_get_top10_gainers_usdt(tradable_usdt)
-                    state["top10"] = top10
-                    state["last_top_refresh"] = now_ts()
+                async with STATE_LOCK:
+                    top10 = list(STATE.get("top10", []) or [])
+                    last_refresh = int(STATE.get("last_top_refresh", 0))
 
-                    for sym in list(state.get("symbols", {}).keys()):
-                        if sym not in top10:
-                            state["symbols"].pop(sym, None)
-
-                    save_state(state)
-                symbols = top10
+                if (now_ts() - last_refresh >= TOP_REFRESH_SEC) or (not top10):
+                    top10_new = await a_get_top10_gainers_usdt(tradable_usdt)
+                    async with STATE_LOCK:
+                        STATE["top10"] = top10_new
+                        STATE["last_top_refresh"] = now_ts()
+                        # cleanup symbol states not in top10
+                        syms = STATE.get("symbols", {}) or {}
+                        for s in list(syms.keys()):
+                            if s not in top10_new:
+                                syms.pop(s, None)
+                        STATE["symbols"] = syms
+                    symbols = top10_new
+                else:
+                    symbols = top10
             else:
                 symbols = SYMBOLS[:]
 
             for sym in symbols:
-                if sym in positions:
-                    continue
-                if len(positions) >= MAX_OPEN_POSITIONS:
-                    break
-
-                st_sym = ensure_symbol_state(state, sym)
+                async with STATE_LOCK:
+                    positions = STATE.get("positions", {}) or {}
+                    if sym in positions:
+                        continue
+                    if len(positions) >= MAX_OPEN_POSITIONS:
+                        break
+                    st_sym = ensure_symbol_state(sym)
 
                 kl = await a_get_klines(sym, INTERVAL, KLINE_LIMIT)
                 price = await a_get_spot_price(sym)
 
                 st_sym, payload = analyze_buy_setup(sym, st_sym, kl, price)
-                update_symbol_state_dict(state, sym, st_sym)
+
+                async with STATE_LOCK:
+                    set_symbol_state(sym, st_sym)
 
                 if payload:
                     await send_approval(app, payload)
-
-            save_state(state)
 
         except Exception as e:
             await tg_send(app, f"⚠️ entry scan error: {e}")
 
         await asyncio.sleep(ENTRY_SCAN_SEC)
+
+
+# =========================
+# Snapshot task (optional)
+# =========================
+async def snapshot_state_task():
+    if STATE_SNAPSHOT_SEC <= 0:
+        return
+    while True:
+        try:
+            async with STATE_LOCK:
+                _save_state_file_snapshot()
+        except Exception:
+            pass
+        await asyncio.sleep(max(STATE_SNAPSHOT_SEC, 10))
 
 
 # =========================
@@ -651,13 +673,18 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "SELL: avtomat (yopilgan yashil sham LOW wick break)\n"
         f"TF={INTERVAL}\n"
         f"MIN_GREEN_RUN={MIN_GREEN_RUN}, MIN_PULLBACK_REDS={MIN_PULLBACK_REDS}\n"
+        f"Timeout={APPROVE_TIMEOUT_SEC}s\n"
     )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
-    st = load_state()
-    prefs = get_prefs(st)
+    async with STATE_LOCK:
+        prefs = get_prefs(STATE)
+        pending_n = len(STATE.get("pending", {}) or {})
+        pos_n = len(STATE.get("positions", {}) or {})
+        top10 = STATE.get("top10", []) or []
+
     msg = (
         f"TF: {INTERVAL}\n"
         f"ENTRY_SCAN_SEC: {ENTRY_SCAN_SEC}\n"
@@ -666,92 +693,95 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Default USDT: {prefs['default_usdt']}\n"
         f"Default risk: {prefs['default_risk']}\n"
         f"MAX_OPEN_POSITIONS: {MAX_OPEN_POSITIONS}\n"
-        f"Pending: {len(st.get('pending', {}) or {})}\n"
-        f"Positions: {len(st.get('positions', {}) or {})}\n"
+        f"Pending: {pending_n}\n"
+        f"Positions: {pos_n}\n"
+        f"Top10: {', '.join(top10[:10])}\n"
     )
     await update.message.reply_text(msg)
 
-async def do_buy_and_reply(q, context: ContextTypes.DEFAULT_TYPE, oid: str, mode_arg: str):
-    # reload state inside task (safer)
-    st = load_state()
-    pending = st.get("pending", {}) or {}
-    positions = st.get("positions", {}) or {}
-    prefs = get_prefs(st)
+async def do_buy_and_reply(app: Application, q, oid: str, mode_arg: str):
+    # take payload atomically and reserve spot (prevents double click / overwrite)
+    async with STATE_LOCK:
+        pending = STATE.get("pending", {}) or {}
+        p = pending.get(oid)
+        if not p:
+            try:
+                await q.edit_message_text("⚠️ Eskirgan yoki topilmadi.")
+            except Exception:
+                pass
+            return
 
-    p = pending.get(oid)
-    if not p:
-        try:
-            await q.edit_message_text("⚠️ Eskirgan yoki topilmadi.")
-        except Exception:
-            pass
-        return
+        # timeout check
+        if now_ts() - int(p.get("ts", 0)) > APPROVE_TIMEOUT_SEC:
+            pending.pop(oid, None)
+            STATE["pending"] = pending
+            reset_symbol(p.get("symbol", ""))
+            try:
+                await q.edit_message_text("⌛ Timeout. Bekor bo‘ldi.")
+            except Exception:
+                pass
+            return
 
-    symbol = p["symbol"]
+        # limits
+        positions = STATE.get("positions", {}) or {}
+        if len(positions) >= MAX_OPEN_POSITIONS:
+            pending.pop(oid, None)
+            STATE["pending"] = pending
+            reset_symbol(p.get("symbol", ""))
+            try:
+                await q.edit_message_text(f"⚠️ Limit: MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS}.")
+            except Exception:
+                pass
+            return
 
-    if now_ts() - int(p.get("ts", 0)) > APPROVE_TIMEOUT_SEC:
-        pending.pop(oid, None)
-        st["pending"] = pending
-        st["symbols"][symbol] = asdict(SymbolState())
-        save_state(st)
-        try:
-            await q.edit_message_text("⌛ Timeout. Bekor bo‘ldi.")
-        except Exception:
-            pass
-        return
+        symbol = p["symbol"]
+        if symbol in positions:
+            pending.pop(oid, None)
+            STATE["pending"] = pending
+            reset_symbol(symbol)
+            try:
+                await q.edit_message_text("⚠️ Bu coinda allaqachon pozitsiya bor.")
+            except Exception:
+                pass
+            return
 
-    if len(positions) >= MAX_OPEN_POSITIONS:
-        pending.pop(oid, None)
-        st["pending"] = pending
-        st["symbols"][symbol] = asdict(SymbolState())
-        save_state(st)
-        try:
-            await q.edit_message_text(f"⚠️ Limit: MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS}.")
-        except Exception:
-            pass
-        return
+        prefs = get_prefs(STATE)
+        size_mode = prefs["size_mode"]
+        usdt_amt = float(prefs["default_usdt"])
+        risk_pct = float(prefs["default_risk"])
+        if mode_arg.startswith("USDT:"):
+            size_mode = "USDT"
+            usdt_amt = safe_float(mode_arg.split(":", 1)[1]) or usdt_amt
 
-    if symbol in positions:
-        pending.pop(oid, None)
-        st["pending"] = pending
-        st["symbols"][symbol] = asdict(SymbolState())
-        save_state(st)
-        try:
-            await q.edit_message_text("⚠️ Bu coinda allaqachon pozitsiya bor.")
-        except Exception:
-            pass
-        return
+        sl = float(p["sl"])
 
-    size_mode = prefs["size_mode"]
-    usdt_amt = float(prefs["default_usdt"])
-    risk_pct = float(prefs["default_risk"])
+        # IMPORTANT: keep pending until success/fail (no loss)
 
-    if mode_arg.startswith("USDT:"):
-        size_mode = "USDT"
-        usdt_amt = safe_float(mode_arg.split(":", 1)[1]) or usdt_amt
-
-    sl = float(p["sl"])
-
+    # outside lock -> do network calls
     try:
         price = await a_get_spot_price(symbol)
         qty = await a_compute_qty(symbol, price, size_mode, usdt_amt, risk_pct)
         await a_place_market_order(symbol, "BUY", qty)
 
-        positions[symbol] = {
-            "qty": qty,
-            "entry": price,
-            "sl": sl,
-            "be_on": False,
-            "trail_low": 0.0,
-            "last_green_close_time": 0,
-            "last_trail_update_ts": 0,
-            "opened_ts": now_ts(),
-        }
-
-        pending.pop(oid, None)
-        st["pending"] = pending
-        st["positions"] = positions
-        st["symbols"][symbol] = asdict(SymbolState())
-        save_state(st)
+        # commit state after success
+        async with STATE_LOCK:
+            positions = STATE.get("positions", {}) or {}
+            positions[symbol] = {
+                "qty": qty,
+                "entry": price,
+                "sl": sl,
+                "be_on": False,
+                "trail_low": 0.0,
+                "last_green_close_time": 0,
+                "last_trail_update_ts": 0,
+                "opened_ts": now_ts(),
+            }
+            STATE["positions"] = positions
+            # remove pending
+            pending = STATE.get("pending", {}) or {}
+            pending.pop(oid, None)
+            STATE["pending"] = pending
+            reset_symbol(symbol)
 
         try:
             await q.edit_message_text(
@@ -765,22 +795,24 @@ async def do_buy_and_reply(q, context: ContextTypes.DEFAULT_TYPE, oid: str, mode
             pass
 
     except Exception as e:
-        pending.pop(oid, None)
-        st["pending"] = pending
-        st["symbols"][symbol] = asdict(SymbolState())
-        save_state(st)
+        # remove pending (so it doesn't clog), reset symbol state
+        async with STATE_LOCK:
+            pending = STATE.get("pending", {}) or {}
+            p2 = pending.pop(oid, None)
+            STATE["pending"] = pending
+            if p2 and p2.get("symbol"):
+                reset_symbol(p2["symbol"])
         try:
             await q.edit_message_text(f"⚠️ BUY FAILED: {e}")
         except Exception:
             pass
-
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
 
-    # ACK immediately
+    # ACK immediately (prevents Telegram timeout)
     try:
         await q.answer("⏳ Qabul qilindi...")
     except Exception:
@@ -800,34 +832,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not parts:
         return
 
-    # REJECT fast
-    if parts[0] == "REJECT":
-        oid = parts[1] if len(parts) > 1 else ""
-        st = load_state()
-        pending = st.get("pending", {}) or {}
-        payload = pending.pop(oid, None)
-        st["pending"] = pending
-        if payload and payload.get("symbol"):
-            st["symbols"][payload["symbol"]] = asdict(SymbolState())
-        save_state(st)
+    action = parts[0]
+    oid = parts[1] if len(parts) > 1 else ""
+    mode_arg = parts[2] if len(parts) > 2 else "DEF"
+
+    if action == "REJECT":
+        async with STATE_LOCK:
+            pending = STATE.get("pending", {}) or {}
+            payload = pending.pop(oid, None)
+            STATE["pending"] = pending
+            if payload and payload.get("symbol"):
+                reset_symbol(payload["symbol"])
         try:
             await q.edit_message_text("❌ Bekor qilindi.")
         except Exception:
             pass
         return
 
-    if parts[0] == "APPROVE":
-        oid = parts[1] if len(parts) > 1 else ""
-        mode_arg = parts[2] if len(parts) > 2 else "DEF"
-
-        # quick UI update (so Telegram won't think it's stuck)
+    if action == "APPROVE":
+        # quick UI update
         try:
             await q.edit_message_text("⏳ Order yuborilyapti...")
         except Exception:
             pass
-
-        # run BUY in background (no blocking)
-        context.application.create_task(do_buy_and_reply(q, context, oid, mode_arg))
+        # run in background
+        context.application.create_task(do_buy_and_reply(context.application, q, oid, mode_arg))
         return
 
 
@@ -842,6 +871,8 @@ def main():
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         raise RuntimeError("BINANCE_API_KEY / BINANCE_API_SECRET env yo'q")
 
+    _load_state_file_once()
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
@@ -851,7 +882,8 @@ def main():
     async def post_init(app_: Application):
         app_.create_task(entry_scanner(app_))
         app_.create_task(monitor_positions(app_))
-        await tg_send(app_, f"✅ START | TF={INTERVAL} | BUY=approval | SELL=auto | non-blocking callbacks")
+        app_.create_task(snapshot_state_task())
+        await tg_send(app_, f"✅ START | TF={INTERVAL} | BUY=approval | SELL=auto | RAM state (no 'Eskirgan')")
 
     app.post_init = post_init
     app.run_polling(drop_pending_updates=True)
