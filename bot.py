@@ -351,7 +351,6 @@ def build_keyboard(order_id: str) -> InlineKeyboardMarkup:
     ])
 
 async def send_approval(app: Application, payload: dict):
-    # pending state is protected by lock -> never disappears
     async with STATE_LOCK:
         pending = STATE.get("pending", {}) or {}
         if len(pending) >= MAX_PENDING:
@@ -538,14 +537,12 @@ async def monitor_positions(app: Application):
                 entry = float(pos.get("entry", 0.0))
                 sl = float(pos.get("sl", 0.0))
 
-                # Break-even optional
                 if BE_TRIGGER > 0 and entry > 0 and (not pos.get("be_on", False)) and price >= entry * (1.0 + BE_TRIGGER):
                     pos["sl"] = entry
                     pos["be_on"] = True
                     changed = True
                     await tg_send(app, f"🟡 BE ON\n{sym}\nSL -> entry {fmt(entry)}")
 
-                # trail update occasionally
                 if (now_ts() - int(pos.get("last_trail_update_ts", 0))) >= max(int(ENTRY_SCAN_SEC), 8):
                     pos["last_trail_update_ts"] = now_ts()
                     pos = await update_trailing_low_from_last_closed_green(sym, pos)
@@ -554,7 +551,6 @@ async def monitor_positions(app: Application):
 
                 trail_low = float(pos.get("trail_low", 0.0))
 
-                # SL
                 if sl > 0 and price <= sl:
                     qty = float(pos.get("qty", 0.0))
                     text = f"🟥 SL SELL\n{sym}\nPrice: {fmt(price)}\nSL: {fmt(sl)}"
@@ -563,7 +559,6 @@ async def monitor_positions(app: Application):
                     changed = True
                     continue
 
-                # SELL on last green low break
                 if trail_low > 0 and price < trail_low:
                     qty = float(pos.get("qty", 0.0))
                     text = f"🟩 SELL (LOW break)\n{sym}\nPrice: {fmt(price)}\nLast green LOW: {fmt(trail_low)}"
@@ -594,7 +589,6 @@ async def entry_scanner(app: Application):
 
     while True:
         try:
-            # refresh top10 if needed
             if SYMBOL_MODE == "TOP10":
                 async with STATE_LOCK:
                     top10 = list(STATE.get("top10", []) or [])
@@ -605,7 +599,6 @@ async def entry_scanner(app: Application):
                     async with STATE_LOCK:
                         STATE["top10"] = top10_new
                         STATE["last_top_refresh"] = now_ts()
-                        # cleanup symbol states not in top10
                         syms = STATE.get("symbols", {}) or {}
                         for s in list(syms.keys()):
                             if s not in top10_new:
@@ -700,7 +693,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def do_buy_and_reply(app: Application, q, oid: str, mode_arg: str):
-    # take payload atomically and reserve spot (prevents double click / overwrite)
     async with STATE_LOCK:
         pending = STATE.get("pending", {}) or {}
         p = pending.get(oid)
@@ -711,7 +703,6 @@ async def do_buy_and_reply(app: Application, q, oid: str, mode_arg: str):
                 pass
             return
 
-        # timeout check
         if now_ts() - int(p.get("ts", 0)) > APPROVE_TIMEOUT_SEC:
             pending.pop(oid, None)
             STATE["pending"] = pending
@@ -722,7 +713,6 @@ async def do_buy_and_reply(app: Application, q, oid: str, mode_arg: str):
                 pass
             return
 
-        # limits
         positions = STATE.get("positions", {}) or {}
         if len(positions) >= MAX_OPEN_POSITIONS:
             pending.pop(oid, None)
@@ -755,15 +745,11 @@ async def do_buy_and_reply(app: Application, q, oid: str, mode_arg: str):
 
         sl = float(p["sl"])
 
-        # IMPORTANT: keep pending until success/fail (no loss)
-
-    # outside lock -> do network calls
     try:
         price = await a_get_spot_price(symbol)
         qty = await a_compute_qty(symbol, price, size_mode, usdt_amt, risk_pct)
         await a_place_market_order(symbol, "BUY", qty)
 
-        # commit state after success
         async with STATE_LOCK:
             positions = STATE.get("positions", {}) or {}
             positions[symbol] = {
@@ -777,7 +763,6 @@ async def do_buy_and_reply(app: Application, q, oid: str, mode_arg: str):
                 "opened_ts": now_ts(),
             }
             STATE["positions"] = positions
-            # remove pending
             pending = STATE.get("pending", {}) or {}
             pending.pop(oid, None)
             STATE["pending"] = pending
@@ -795,7 +780,6 @@ async def do_buy_and_reply(app: Application, q, oid: str, mode_arg: str):
             pass
 
     except Exception as e:
-        # remove pending (so it doesn't clog), reset symbol state
         async with STATE_LOCK:
             pending = STATE.get("pending", {}) or {}
             p2 = pending.pop(oid, None)
@@ -812,7 +796,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q:
         return
 
-    # ACK immediately (prevents Telegram timeout)
     try:
         await q.answer("⏳ Qabul qilindi...")
     except Exception:
@@ -850,19 +833,42 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "APPROVE":
-        # quick UI update
         try:
             await q.edit_message_text("⏳ Order yuborilyapti...")
         except Exception:
             pass
-        # run in background
         context.application.create_task(do_buy_and_reply(context.application, q, oid, mode_arg))
         return
 
 
 # =========================
+# Error handler (fixes "No error handlers are registered")
+# =========================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        err = context.error
+        app = context.application
+        await tg_send(app, f"⚠️ ERROR: {err}")
+    except Exception:
+        pass
+
+
+# =========================
 # Main
 # =========================
+async def post_init(app: Application):
+    # Polling/webhook aralashib ketmasin:
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
+    app.create_task(entry_scanner(app))
+    app.create_task(monitor_positions(app))
+    app.create_task(snapshot_state_task())
+
+    await tg_send(app, f"✅ START | TF={INTERVAL} | BUY=approval | SELL=auto | RAM state (no 'Eskirgan')")
+
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN env yo'q")
@@ -873,19 +879,19 @@ def main():
 
     _load_state_file_once()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application
+        .builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)   # ✅ to'g'ri yo'l
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_error_handler(on_error)  # ✅ "No error handlers..." yo'qoladi
 
-    async def post_init(app_: Application):
-        app_.create_task(entry_scanner(app_))
-        app_.create_task(monitor_positions(app_))
-        app_.create_task(snapshot_state_task())
-        await tg_send(app_, f"✅ START | TF={INTERVAL} | BUY=approval | SELL=auto | RAM state (no 'Eskirgan')")
-
-    app.post_init = post_init
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
